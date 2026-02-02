@@ -8,25 +8,55 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::process::{ExitCode, Termination};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LogStateEntry {
-    inode: u64,
-    pos: u64,
+const MAX_LOOKBEHIND: usize = 100;
+
+#[repr(u32)]
+enum NagiosCode {
+    Ok = 0,
+    Warning = 1,
+    Critical = 2,
+    Unknown = 3,
 }
 
-type LogState = HashMap<String, LogStateEntry>;
+impl Termination for NagiosCode {
+    fn report(self) -> ExitCode {
+        ExitCode::from(self as u8)
+    }
+}
+
+/// Log file scanning cursor structure that passes state between invocations.
+/// Enables detection of file rotations, truncation, and skipping entries
+/// that are too old.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LogCursor {
+    /// Inode of the log file this cursor tracks
+    inode: u64,
+    /// Hint where to start scanning the next time we are executed
+    start_pos_hint: u64,
+    // XXX for truncations, need so save some bytes at start_pos
+}
+
+
+struct TimestampSpec {
+    /// strftime format of the timestamp
+    format: String,
+    /// Number of space-separated fields before timestamp begins
+    offset: usize,
+}
+
+type LogState = HashMap<String, LogCursor>;
 
 #[derive(Parser, Debug, Serialize)]
 #[command(
     name = "log-event-count",
-    version,
     about = "A check_mk MRPE plugin that reports the number of lines containing \
      SUBSTRING in LOGFILE that occurred within last MINUTES. The script may \
-     undercount slightly.",
+     undercount slightly."
 )]
 struct Args {
-    /// Metric label for perfdata graph
+    /// Metric label for check_mk perfdata graph
     #[arg()]
     metric: String,
 
@@ -64,20 +94,20 @@ struct Args {
     input_limit: u64,
 }
 
-fn extract_ts_fields(line: &str, offset: usize, num_elts: usize) -> Option<String> {
+fn extract_ts(line: &str,
+              start_field_idx: usize,  // Number of space-separated fields before timestamp begins
+              num_fields: usize) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if offset >= parts.len() {
+    let last_field_idx = start_field_idx + num_fields;
+    if parts.len() < last_field_idx {
         return None;
     }
-    let end = std::cmp::min(parts.len(), offset + num_elts);
-    if offset >= end {
-        return None;
-    }
-    Some(parts[offset..end].join(" "))
+    Some(parts[start_field_idx..last_field_idx].join(" "))
 }
-fn parse_timestamp_local(line: &str, fmt: &str, offset: usize) -> Option<i64> {
+
+fn parse_ts_local(line: &str, fmt: &str, offset: usize) -> Option<i64> {
     let num_elts = fmt.split_whitespace().count();
-    let ts_str = extract_ts_fields(line, offset, num_elts)?;
+    let ts_str = extract_ts(line, offset, num_elts)?;
 
     let naive = if fmt.contains("%Y") {
         NaiveDateTime::parse_from_str(&ts_str, fmt).ok()?
@@ -91,6 +121,7 @@ fn parse_timestamp_local(line: &str, fmt: &str, offset: usize) -> Option<i64> {
     let dt = Local.from_local_datetime(&naive).single()?;
     Some(dt.timestamp())
 }
+
 fn count_matches(
     substrings: &[String],
     file_name: &str,
@@ -101,33 +132,33 @@ fn count_matches(
     ts_offset: usize,
 ) -> io::Result<(u64, u64)> {
     let mut count: u64 = 0;
+    let mut first_match_pos = 0;
 
     let f = File::open(file_name)?;
     let mut reader = BufReader::new(f);
 
     reader.seek(SeekFrom::Start(start_pos))?;
 
-    let mut lookbehind: VecDeque<String> = VecDeque::with_capacity(100);
+    let mut lookbehind: VecDeque<String> = VecDeque::with_capacity(MAX_LOOKBEHIND);
 
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
+        if reader.read_line(&mut line)? == 0 {
             break;
         }
 
         lookbehind.push_back(line.clone());
-        if lookbehind.len() > 100 {
+        if lookbehind.len() > MAX_LOOKBEHIND {
             lookbehind.pop_front();
         }
 
         if substrings.iter().any(|s| line.contains(s)) {
             // Try timestamp from this line; otherwise scan backward in lookbehind.
-            let mut ts = parse_timestamp_local(&line, ts_fmt, ts_offset).unwrap_or(0);
+            let mut ts = parse_ts_local(&line, ts_fmt, ts_offset).unwrap_or(0);
             if ts == 0 {
                 for prev in lookbehind.iter().rev() {
-                    if let Some(t) = parse_timestamp_local(prev, ts_fmt, ts_offset) {
+                    if let Some(t) = parse_ts_local(prev, ts_fmt, ts_offset) {
                         ts = t;
                         break;
                     }
@@ -137,6 +168,9 @@ fn count_matches(
             let last_ts = ts;
 
             if now - ts < interval_minutes * 60 {
+                if count == 0 {
+                    first_match_pos = reader.stream_position()?;
+                }
                 count += 1;
             }
             if last_ts > now {
@@ -145,8 +179,11 @@ fn count_matches(
         }
     }
 
-    let end_pos = reader.stream_position()?;
-    Ok((count, end_pos))
+    if first_match_pos > 0 {
+        Ok((count, first_match_pos))
+    } else{
+        Ok((count, start_pos))
+    }
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -178,7 +215,7 @@ fn load_state(path: &PathBuf) -> io::Result<LogState> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
     println!("args = {:?}", args);
 
@@ -187,7 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if warn_threshold > crit_threshold {
         eprintln!("Warning threshold is greater than critical threshold");
-        std::process::exit(1);
+        std::process::exit(NagiosCode::Unknown as i32);
     }
     let now = args.now.unwrap_or_else(|| Local::now().timestamp());
     let input_size_limit = args.input_limit * (1u64 << 20);
@@ -201,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reconcile state vs filesystem (missing files, rotations, truncations, tail-limits).
     for logfile in &args.logfiles {
-        let md = match fs::metadata(logfile) {
+        let logfile_md = match fs::metadata(logfile) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 log_state.remove(logfile);
@@ -210,25 +247,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => return Err(Box::new(e)),
         };
 
-        let inode = md.ino();
-        let size = md.len();
+        let inode = logfile_md.ino();
+        let size = logfile_md.len();
 
         match log_state.get_mut(logfile) {
             None => {
-                log_state.insert(logfile.clone(), LogStateEntry { inode, pos: 0 });
+                log_state.insert(logfile.clone(), LogCursor { inode, start_pos_hint: 0 });
             }
             Some(ent) => {
                 if ent.inode != inode {
-                    *ent = LogStateEntry { inode, pos: 0 };
-                } else if ent.pos > size {
-                    ent.pos = 0;
+                    *ent = LogCursor { inode, start_pos_hint: 0 };
+                } else if ent.start_pos_hint > size {
+                    ent.start_pos_hint = 0;
                 }
             }
         }
         // Apply input-limit tail rule.
         if let Some(ent) = log_state.get_mut(logfile) {
-            if size.saturating_sub(ent.pos) > input_size_limit {
-                ent.pos = size.saturating_sub(input_size_limit);
+            if size.saturating_sub(ent.start_pos_hint) > input_size_limit {
+                ent.start_pos_hint = size.saturating_sub(input_size_limit);
             }
         }
     }
@@ -239,9 +276,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Iterate over the keys we currently have in state (like the Python code).
     let keys: Vec<String> = log_state.keys().cloned().collect();
     for logfile in keys {
-        let start_pos = log_state.get(&logfile).map(|e| e.pos).unwrap_or(0);
+        let start_pos = log_state.get(&logfile).map(|e| e.last_first_match_pos).unwrap_or(0);
 
-        let (count, end_pos) = match count_matches(
+        let (count, start_pos_hint) = match count_matches(
             &args.strings,
             &logfile,
             start_pos,
@@ -263,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match_count += count;
 
         if let Some(ent) = log_state.get_mut(&logfile) {
-            ent.pos = end_pos;
+            ent.start_pos_hint = start_pos_hint;
         }
         save_state(&state_path, &log_state)?;
     }
@@ -274,11 +311,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if (match_count as f64) >= crit_threshold {
-        std::process::exit(2);
+        std::process::exit(NagiosCode::Critical as i32);
+    } else if (match_count as f64) >= warn_threshold {
+        std::process::exit(NagiosCode::Warning as i32);
+    } else {
+        std::process::exit(NagiosCode::Ok as i32);
     }
-    if (match_count as f64) >= warn_threshold {
-        std::process::exit(1);
-    }
-
-    Ok(())
 }
