@@ -1,0 +1,11 @@
+[package]
+name = "log-event-count"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", features = ["clock"] }
+md-5 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
