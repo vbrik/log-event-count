@@ -39,25 +39,37 @@ struct LogCursor {
     // XXX for truncations, need so save some bytes at start_pos
 }
 
-struct TimestampSpec {
-    /// strftime format of the timestamp
-    format: String,
-    /// Number of space-separated fields before timestamp begins
-    start_field_index: usize,
-    /// Number of (whitespace-separated) fields in format
-    num_fields: usize,
-}
+mod timestamp_spec {
+    pub struct TimestampSpec {
+        /// strftime format of the timestamp
+        format: String,
+        /// Number of space-separated fields before timestamp begins
+        start_field_index: usize,
+        /// Number of (whitespace-separated) fields in format
+        num_fields: usize,
+    }
 
-impl TimestampSpec {
-    pub fn new(format: String, start_field_index: usize) -> Self {
-        let num_fields = format.split_whitespace().count();
-        Self {
-            format,
-            start_field_index,
-            num_fields,
+    impl TimestampSpec {
+        pub fn new(format: String, start_field_index: usize) -> Self {
+            let num_fields = format.split_whitespace().count();
+            Self {
+                format,
+                start_field_index,
+                num_fields,
+            }
+        }
+        pub fn format(&self) -> &str {
+            &self.format // note implicit cast (self.format wouldn't work)
+        }
+        pub fn start_field_index(&self) -> usize {
+            self.start_field_index
+        }
+        pub fn num_fields(&self) -> usize {
+            self.num_fields
         }
     }
 }
+use timestamp_spec::TimestampSpec;
 
 type LogState = HashMap<String, LogCursor>;
 
@@ -108,22 +120,22 @@ struct Args {
 
 fn extract_ts(line: &str, ts_spec: &TimestampSpec) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let last_field_idx = ts_spec.start_field_index + ts_spec.num_fields;
+    let last_field_idx = ts_spec.start_field_index() + ts_spec.num_fields();
     if parts.len() < last_field_idx {
         return None;
     }
-    Some(parts[ts_spec.start_field_index..last_field_idx].join(" "))
+    Some(parts[ts_spec.start_field_index()..last_field_idx].join(" "))
 }
 
 fn parse_ts_local(line: &str, ts_spec: &TimestampSpec) -> Option<i64> {
     let ts_str = extract_ts(line, ts_spec)?;
 
-    let naive = if ts_spec.format.contains("%Y") {
-        NaiveDateTime::parse_from_str(&ts_str, ts_spec.format.as_str()).ok()?
+    let naive = if ts_spec.format().contains("%Y") {
+        NaiveDateTime::parse_from_str(&ts_str, ts_spec.format()).ok()?
     } else {
         let year = Local::now().year();
         let ts2 = format!("{} {}", year, ts_str);
-        let fmt2 = format!("%Y {}", ts_spec.format);
+        let fmt2 = format!("%Y {}", ts_spec.format());
         NaiveDateTime::parse_from_str(&ts2, &fmt2).ok()?
     };
 
@@ -251,6 +263,7 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 log_state.remove(logfile);
+                println!("{}", logfile);
                 continue;
             }
             Err(e) => return Err(Box::new(e)),
