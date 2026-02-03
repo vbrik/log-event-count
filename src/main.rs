@@ -9,6 +9,7 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{ExitCode, Termination};
+use std::string::ToString;
 
 const MAX_LOOKBEHIND: usize = 100;
 
@@ -38,12 +39,24 @@ struct LogCursor {
     // XXX for truncations, need so save some bytes at start_pos
 }
 
-
 struct TimestampSpec {
     /// strftime format of the timestamp
     format: String,
     /// Number of space-separated fields before timestamp begins
-    offset: usize,
+    start_field_index: usize,
+    /// Number of (whitespace-separated) fields in format
+    num_fields: usize,
+}
+
+impl TimestampSpec {
+    pub fn new(format: String, start_field_index: usize) -> Self {
+        let num_fields = format.split_whitespace().count();
+        Self {
+            format,
+            start_field_index,
+            num_fields,
+        }
+    }
 }
 
 type LogState = HashMap<String, LogCursor>;
@@ -52,29 +65,28 @@ type LogState = HashMap<String, LogCursor>;
 #[command(
     name = "log-event-count",
     about = "A check_mk MRPE plugin that reports the number of lines containing \
-     SUBSTRING in LOGFILE that occurred within last MINUTES. The script may \
-     undercount slightly."
+     SUBSTRING in LOGFILE that occurred within last MINUTES."
 )]
 struct Args {
     /// Metric label for check_mk perfdata graph
     #[arg()]
     metric: String,
 
-    /// Log files to read
+    /// Log file(s) to read
     #[arg(long, value_name = "LOGFILE", num_args = 1..)]
     logfiles: Vec<String>,
 
-    /// Strings to match
+    /// String(s) to match
     #[arg(long, value_name = "SUBSTRING", num_args = 1.. )]
     strings: Vec<String>,
 
     /// Timestamp strptime format
-    #[arg(long, value_name = "FORMAT")]
+    #[arg(long, value_name = "FORMAT", default_value = "%a %b %e %H:%M:%S %Y")]
     ts_fmt: String,
 
-    /// Number of space-separated fields before timestamp begins
+    /// Index of the (whitespace-separated) field where the timestamp begins
     #[arg(long, value_name = "NUM", default_value_t = 0)]
-    ts_offset: usize,
+    ts_idx: usize,
 
     /// Interval time in minutes
     #[arg(long, value_name = "MINUTES", default_value_t = 60)]
@@ -94,27 +106,24 @@ struct Args {
     input_limit: u64,
 }
 
-fn extract_ts(line: &str,
-              start_field_idx: usize,  // Number of space-separated fields before timestamp begins
-              num_fields: usize) -> Option<String> {
+fn extract_ts(line: &str, ts_spec: &TimestampSpec) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let last_field_idx = start_field_idx + num_fields;
+    let last_field_idx = ts_spec.start_field_index + ts_spec.num_fields;
     if parts.len() < last_field_idx {
         return None;
     }
-    Some(parts[start_field_idx..last_field_idx].join(" "))
+    Some(parts[ts_spec.start_field_index..last_field_idx].join(" "))
 }
 
-fn parse_ts_local(line: &str, fmt: &str, offset: usize) -> Option<i64> {
-    let num_elts = fmt.split_whitespace().count();
-    let ts_str = extract_ts(line, offset, num_elts)?;
+fn parse_ts_local(line: &str, ts_spec: &TimestampSpec) -> Option<i64> {
+    let ts_str = extract_ts(line, ts_spec)?;
 
-    let naive = if fmt.contains("%Y") {
-        NaiveDateTime::parse_from_str(&ts_str, fmt).ok()?
+    let naive = if ts_spec.format.contains("%Y") {
+        NaiveDateTime::parse_from_str(&ts_str, ts_spec.format.as_str()).ok()?
     } else {
         let year = Local::now().year();
         let ts2 = format!("{} {}", year, ts_str);
-        let fmt2 = format!("%Y {}", fmt);
+        let fmt2 = format!("%Y {}", ts_spec.format);
         NaiveDateTime::parse_from_str(&ts2, &fmt2).ok()?
     };
 
@@ -128,8 +137,7 @@ fn count_matches(
     start_pos: u64,
     now: i64,
     interval_minutes: i64,
-    ts_fmt: &str,
-    ts_offset: usize,
+    ts_spec: &TimestampSpec,
 ) -> io::Result<(u64, u64)> {
     let mut count: u64 = 0;
     let mut first_match_pos = 0;
@@ -155,10 +163,10 @@ fn count_matches(
 
         if substrings.iter().any(|s| line.contains(s)) {
             // Try timestamp from this line; otherwise scan backward in lookbehind.
-            let mut ts = parse_ts_local(&line, ts_fmt, ts_offset).unwrap_or(0);
+            let mut ts = parse_ts_local(&line, ts_spec).unwrap_or(0);
             if ts == 0 {
                 for prev in lookbehind.iter().rev() {
-                    if let Some(t) = parse_ts_local(prev, ts_fmt, ts_offset) {
+                    if let Some(t) = parse_ts_local(prev, ts_spec) {
                         ts = t;
                         break;
                     }
@@ -181,7 +189,7 @@ fn count_matches(
 
     if first_match_pos > 0 {
         Ok((count, first_match_pos))
-    } else{
+    } else {
         Ok((count, start_pos))
     }
 }
@@ -233,6 +241,7 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
     let args_hash = hash_bytes(&args_bytes);
     let state_path = PathBuf::from(format!("/tmp/{}_{}", args.metric, args_hash));
     let mut log_state = load_state(&state_path)?;
+    let ts_spec = TimestampSpec::new(args.ts_fmt.clone(), args.ts_idx);
 
     println!("{} {}", args_hash, state_path.display());
 
@@ -252,11 +261,20 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
 
         match log_state.get_mut(logfile) {
             None => {
-                log_state.insert(logfile.clone(), LogCursor { inode, start_pos_hint: 0 });
+                log_state.insert(
+                    logfile.clone(),
+                    LogCursor {
+                        inode,
+                        start_pos_hint: 0,
+                    },
+                );
             }
             Some(ent) => {
                 if ent.inode != inode {
-                    *ent = LogCursor { inode, start_pos_hint: 0 };
+                    *ent = LogCursor {
+                        inode,
+                        start_pos_hint: 0,
+                    };
                 } else if ent.start_pos_hint > size {
                     ent.start_pos_hint = 0;
                 }
@@ -276,7 +294,10 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
     // Iterate over the keys we currently have in state (like the Python code).
     let keys: Vec<String> = log_state.keys().cloned().collect();
     for logfile in keys {
-        let start_pos = log_state.get(&logfile).map(|e| e.last_first_match_pos).unwrap_or(0);
+        let start_pos = log_state
+            .get(&logfile)
+            .map(|e| e.start_pos_hint)
+            .unwrap_or(0);
 
         let (count, start_pos_hint) = match count_matches(
             &args.strings,
@@ -284,8 +305,7 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
             start_pos,
             now,
             args.interval,
-            &args.ts_fmt,
-            args.ts_offset,
+            &ts_spec,
         ) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
