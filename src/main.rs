@@ -118,6 +118,82 @@ struct Args {
     input_limit: u64,
 }
 
+fn skip_whitespace(cursor: &mut usize, bytes: &[u8]) {
+    while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
+    }
+}
+
+fn skip_field(cursor: &mut usize, bytes: &[u8]) {
+    while *cursor < bytes.len() && !bytes[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
+    }
+}
+
+fn nth_field_start_ascii(s: &str, target_field_idx: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut cursor = 0usize;
+    let mut cur_field_idx = 0usize;
+
+    // Skip leading whitespace
+    while cursor < b.len() && b[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    loop {
+        if cursor >= b.len() {
+            return None;
+        }
+        if cur_field_idx == target_field_idx {
+            return Some(cursor);
+        }
+
+        // Skip this field
+        while cursor < b.len() && !b[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        // Skip whitespace after this field
+        while cursor < b.len() && b[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+
+        cur_field_idx += 1;
+    }
+}
+
+fn extract_ts2<'a>(line: &'a str, ts_spec: &TimestampSpec) -> Option<&'a str> {
+    let ts_first: usize;
+    let mut cursor = 0usize;
+    let mut fields_found = 0usize;
+    let bytes = line.as_bytes();
+
+    loop {
+        skip_whitespace(&mut cursor, bytes);
+        if cursor >= bytes.len() {
+            return None;
+        }
+        fields_found += 1;
+        if fields_found == ts_spec.start_field_index() + 1 {
+            ts_first = cursor;
+            break;
+        }
+        skip_field(&mut cursor, bytes);
+    }
+
+    loop {
+        skip_field(&mut cursor, bytes);
+        if fields_found == ts_spec.start_field_index() + 1 + ts_spec.num_fields() {
+            return Some(&line[ts_first..cursor]);
+        }
+        skip_whitespace(&mut cursor, bytes);
+        if cursor >= bytes.len() {
+            return None;
+        }
+        fields_found += 1;
+    }
+}
+
 fn extract_ts(line: &str, ts_spec: &TimestampSpec) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let last_field_idx = ts_spec.start_field_index() + ts_spec.num_fields();
@@ -128,7 +204,7 @@ fn extract_ts(line: &str, ts_spec: &TimestampSpec) -> Option<String> {
 }
 
 fn parse_ts_local(line: &str, ts_spec: &TimestampSpec) -> Option<i64> {
-    let ts_str = extract_ts(line, ts_spec)?;
+    let ts_str = extract_ts2(line, ts_spec)?;
 
     let naive = if ts_spec.format().contains("%Y") {
         NaiveDateTime::parse_from_str(&ts_str, ts_spec.format()).ok()?
