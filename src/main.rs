@@ -85,18 +85,18 @@ struct Args {
     metric: String,
 
     /// Log file(s) to read
-    #[arg(long, value_name = "LOGFILE", num_args = 1..)]
+    #[arg(long, value_name = "PATH", num_args = 1..)]
     logfiles: Vec<String>,
 
-    /// String(s) to match
-    #[arg(long, value_name = "SUBSTRING", num_args = 1.. )]
+    /// String(s) to match in log lines
+    #[arg(long, value_name = "STRING", num_args = 1.. )]
     strings: Vec<String>,
 
-    /// Timestamp strptime format
+    /// Timestamp's strptime format
     #[arg(long, value_name = "FORMAT", default_value = "%a %b %e %H:%M:%S %Y")]
     ts_fmt: String,
 
-    /// Index of the (whitespace-separated) field where the timestamp begins
+    /// Index (starting from 0) of the (whitespace-separated) field where the timestamp begins
     #[arg(long, value_name = "NUM", default_value_t = 0)]
     ts_idx: usize,
 
@@ -130,38 +130,6 @@ fn skip_field(cursor: &mut usize, bytes: &[u8]) {
     }
 }
 
-fn nth_field_start_ascii(s: &str, target_field_idx: usize) -> Option<usize> {
-    let b = s.as_bytes();
-    let mut cursor = 0usize;
-    let mut cur_field_idx = 0usize;
-
-    // Skip leading whitespace
-    while cursor < b.len() && b[cursor].is_ascii_whitespace() {
-        cursor += 1;
-    }
-
-    loop {
-        if cursor >= b.len() {
-            return None;
-        }
-        if cur_field_idx == target_field_idx {
-            return Some(cursor);
-        }
-
-        // Skip this field
-        while cursor < b.len() && !b[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-
-        // Skip whitespace after this field
-        while cursor < b.len() && b[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-
-        cur_field_idx += 1;
-    }
-}
-
 fn extract_ts2<'a>(line: &'a str, ts_spec: &TimestampSpec) -> Option<&'a str> {
     let ts_first: usize;
     let mut cursor = 0usize;
@@ -183,7 +151,7 @@ fn extract_ts2<'a>(line: &'a str, ts_spec: &TimestampSpec) -> Option<&'a str> {
 
     loop {
         skip_field(&mut cursor, bytes);
-        if fields_found == ts_spec.start_field_index() + 1 + ts_spec.num_fields() {
+        if fields_found == ts_spec.start_field_index() + ts_spec.num_fields() {
             return Some(&line[ts_first..cursor]);
         }
         skip_whitespace(&mut cursor, bytes);
@@ -232,45 +200,43 @@ fn count_matches(
 
     let f = File::open(file_name)?;
     let mut reader = BufReader::new(f);
-
     reader.seek(SeekFrom::Start(start_pos))?;
 
-    let mut lookbehind: VecDeque<String> = VecDeque::with_capacity(MAX_LOOKBEHIND);
+    let mut multiline_context: VecDeque<String> = VecDeque::with_capacity(MAX_LOOKBEHIND);
 
     let mut line = String::new();
-    loop {
+    'iter_lines: loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;
         }
 
-        lookbehind.push_back(line.clone());
-        if lookbehind.len() > MAX_LOOKBEHIND {
-            lookbehind.pop_front();
+        multiline_context.push_back(line.clone());
+        if multiline_context.len() > MAX_LOOKBEHIND {
+            multiline_context.pop_front();
         }
 
         if substrings.iter().any(|s| line.contains(s)) {
             // Try timestamp from this line; otherwise scan backward in lookbehind.
-            let mut ts = parse_ts_local(&line, ts_spec).unwrap_or(0);
-            if ts == 0 {
-                for prev in lookbehind.iter().rev() {
-                    if let Some(t) = parse_ts_local(prev, ts_spec) {
-                        ts = t;
-                        break;
-                    }
+            let ts = match parse_ts_local(&line, ts_spec).or_else(|| {
+                multiline_context
+                    .iter()
+                    .rev()
+                    .find_map(|prev_line| parse_ts_local(prev_line, ts_spec))
+            }) {
+                Some(ts) => ts,
+                None => {
+                    continue 'iter_lines;
                 }
-            }
+            };
 
-            let last_ts = ts;
-
-            if now - ts < interval_minutes * 60 {
+            if ts > now {
+                break;
+            } else if now - ts < interval_minutes * 60 {
                 if count == 0 {
                     first_match_pos = reader.stream_position()?;
                 }
                 count += 1;
-            }
-            if last_ts > now {
-                break;
             }
         }
     }
