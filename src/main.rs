@@ -37,8 +37,11 @@ struct LogCursor {
     /// Hint where to start scanning the next time we are executed
     start_pos_hint: u64,
     // XXX for truncations, need so save some bytes at start_pos
+    //start_pos_bytes: Vec<u8>,
 }
 
+// Put this in a module so it can't be mutated even in this module
+// (to force correct field initialization)
 mod timestamp_spec {
     pub struct TimestampSpec {
         /// strftime format of the timestamp
@@ -118,7 +121,7 @@ struct Args {
     input_limit: u64,
 }
 
-fn skip_whitespace(cursor: &mut usize, bytes: &[u8]) {
+pub fn skip_whitespace(cursor: &mut usize, bytes: &[u8]) {
     while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
         *cursor += 1;
     }
@@ -162,20 +165,11 @@ fn extract_ts2<'a>(line: &'a str, ts_spec: &TimestampSpec) -> Option<&'a str> {
     }
 }
 
-fn extract_ts(line: &str, ts_spec: &TimestampSpec) -> Option<String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    let last_field_idx = ts_spec.start_field_index() + ts_spec.num_fields();
-    if parts.len() < last_field_idx {
-        return None;
-    }
-    Some(parts[ts_spec.start_field_index()..last_field_idx].join(" "))
-}
-
 fn parse_ts_local(line: &str, ts_spec: &TimestampSpec) -> Option<i64> {
     let ts_str = extract_ts2(line, ts_spec)?;
 
     let naive = if ts_spec.format().contains("%Y") {
-        NaiveDateTime::parse_from_str(&ts_str, ts_spec.format()).ok()?
+        NaiveDateTime::parse_from_str(ts_str, ts_spec.format()).ok()?
     } else {
         let year = Local::now().year();
         let ts2 = format!("{} {}", year, ts_str);
@@ -232,7 +226,8 @@ fn count_matches(
 
             if ts > now {
                 break;
-            } else if now - ts < interval_minutes * 60 {
+            }
+            if now - ts < interval_minutes * 60 {
                 if count == 0 {
                     first_match_pos = reader.stream_position()?;
                 }
@@ -281,12 +276,12 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
     println!("args = {:?}", args);
 
-    let warn_threshold = args.thresholds.get(0).copied().unwrap_or(f64::INFINITY);
+    let warn_threshold = args.thresholds.first().copied().unwrap_or(f64::INFINITY);
     let crit_threshold = args.thresholds.get(1).copied().unwrap_or(f64::INFINITY);
 
     if warn_threshold > crit_threshold {
         eprintln!("Warning threshold is greater than critical threshold");
-        std::process::exit(NagiosCode::Unknown as i32);
+        return Ok(NagiosCode::Unknown);
     }
     let now = args.now.unwrap_or_else(|| Local::now().timestamp());
     let input_size_limit = args.input_limit * (1u64 << 20);
@@ -300,6 +295,7 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
     println!("{} {}", args_hash, state_path.display());
 
     // Reconcile state vs filesystem (missing files, rotations, truncations, tail-limits).
+    // This is race. It should be done after we have a handle for the logfile
     for logfile in &args.logfiles {
         let logfile_md = match fs::metadata(logfile) {
             Ok(m) => m,
@@ -336,17 +332,17 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
             }
         }
         // Apply input-limit tail rule.
-        if let Some(ent) = log_state.get_mut(logfile) {
-            if size.saturating_sub(ent.start_pos_hint) > input_size_limit {
-                ent.start_pos_hint = size.saturating_sub(input_size_limit);
-            }
+        if let Some(ent) = log_state.get_mut(logfile)
+            && size.saturating_sub(ent.start_pos_hint) > input_size_limit
+        {
+            ent.start_pos_hint = size.saturating_sub(input_size_limit);
         }
     }
     save_state(&state_path, &log_state)?;
 
     let mut match_count: u64 = 0;
 
-    // Iterate over the keys we currently have in state (like the Python code).
+    // Iterate over the keys we currently have in state
     let keys: Vec<String> = log_state.keys().cloned().collect();
     for logfile in keys {
         let start_pos = log_state
@@ -386,10 +382,33 @@ fn main() -> Result<NagiosCode, Box<dyn std::error::Error>> {
     );
 
     if (match_count as f64) >= crit_threshold {
-        std::process::exit(NagiosCode::Critical as i32);
+        Ok(NagiosCode::Critical)
     } else if (match_count as f64) >= warn_threshold {
-        std::process::exit(NagiosCode::Warning as i32);
+        Ok(NagiosCode::Warning)
     } else {
-        std::process::exit(NagiosCode::Ok as i32);
+        Ok(NagiosCode::Ok)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skip_whitespace() {
+        let cases = vec![
+            (0, 1, " x "),
+            (0, 4, " \n\t "),
+            (0, 0, "x "),
+            (1, 3, "x  "),
+            (1, 1, " "),
+        ];
+        let mut cursor;
+
+        for (start, target, str) in cases {
+            cursor = start;
+            skip_whitespace(&mut cursor, str.as_bytes());
+            assert_eq!(cursor, target);
+        }
     }
 }
